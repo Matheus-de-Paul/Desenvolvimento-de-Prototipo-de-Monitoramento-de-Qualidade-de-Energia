@@ -1,0 +1,401 @@
+/*
+ * ================================================================
+ *  TRANSMISSOR LoRa - Protótipo de qualidade de energia (ESP32 A)
+ *  Ponto de medição: mede o motor WEG W22 Plus e envia por LoRa
+ * ================================================================
+ *  Sensores (iguais ao teste do motor):
+ *    Tensão:   ZMPT101B entre FASE L1 e NEUTRO -> divisor 10k/20k -> GPIO34
+ *    Corrente: SCT-013 30A/1V só na FASE L1 -> 1,65 V (10k/10k) -> 1k -> GPIO35
+ *
+ *  Módulo LoRa RFM95W (alimentar SOMENTE com 3,3 V):
+ *    RFM95W  ->  ESP32
+ *    VCC     ->  3V3
+ *    GND     ->  GND
+ *    SCK     ->  GPIO18
+ *    MISO    ->  GPIO19
+ *    MOSI    ->  GPIO23
+ *    NSS/CS  ->  GPIO5
+ *    RESET   ->  GPIO14
+ *    DIO0    ->  GPIO26
+ *  (se no teste de comunicação de 03/09 vocês usaram outros pinos,
+ *   troquem os números em "PINOS DO LoRa")
+ *
+ *  Bibliotecas: arduinoFFT (Enrique Condes) 2.x  e  LoRa (Sandeep Mistry)
+ * ================================================================
+ */
+#include <SPI.h>
+#include <LoRa.h>
+#include <arduinoFFT.h>
+
+// ===================== PINOS DOS SENSORES =====================
+const int PINO_TENSAO   = 34;
+const int PINO_CORRENTE = 35;
+
+// ===================== PINOS DO LoRa =====================
+const int LORA_SCK  = 18;
+const int LORA_MISO = 19;
+const int LORA_MOSI = 23;
+const int LORA_SS   = 5;
+const int LORA_RST  = 14;
+const int LORA_DIO0 = 26;
+
+// ===================== CONFIGURAÇÃO DO RÁDIO =====================
+// (TEM que ser igual no transmissor e no receptor)
+const long    LORA_FREQ        = 915E6;  // 915 MHz
+const int     LORA_SF          = 7;      // 7 = mais rápido; 9 a 12 = mais alcance
+const long    LORA_BANDA       = 125E3;  // largura de banda (Hz)
+const uint8_t LORA_SYNC_WORD   = 0xF3;   // "senha" da rede (igual nos dois)
+const int     LORA_POTENCIA    = 17;     // dBm (2 a 20)
+const int     RELATORIOS_POR_ENVIO = 6;  // média de 6 relatórios (~4 s) por pacote
+
+// ===================== AMOSTRAGEM =====================
+const int N_AMOSTRAS     = 64;   // amostras por ciclo da rede
+const int N_CICLOS_MEDIA = 30;   // ciclos por relatório (~0,5 s)
+const int N_HARMONICOS   = 10;   // harmônicos (60 Hz até 600 Hz)
+
+// ===================== CALIBRAÇÃO =====================
+const double FATOR_TENSAO   = 0.30;   // V por contagem do ADC
+const double FATOR_CORRENTE = 0.024;  // A por contagem do ADC
+const int    N_VOLTAS       = 1;      // motor: 1 volta na pinça
+const double RUIDO_I_RMS    = 0.0;
+// Deixe igual ao teste do motor que deu certo (FP indutivo e P positiva).
+// Se a potência ativa sair negativa, troque para true OU vire a pinça.
+const bool   INVERTER_CORRENTE   = false;
+const double CORRECAO_FASE_GRAUS = 23.6;  // calibrada com a lâmpada
+const bool   TRIFASICO_EQUILIBRADO = true; // motor: envia totais trifásicos (x3)
+
+// ===================== LIMIARES =====================
+const double VRMS_MINIMO = 20.0;
+const double IRMS_MINIMO = 0.10;
+const double I_PARTIDA   = 1.5 * 3.42;   // acima disso: considera partida (A)
+
+// ===================== PACOTE LoRa =====================
+// A MESMA struct tem que estar no receptor (mesma ordem e mesmos tipos)
+struct __attribute__((packed)) PacoteQEE {
+  uint16_t contador;        // número do pacote (para detectar perdas)
+  uint8_t  flags;           // bit0: tem tensão | bit1: tem corrente | bit2: partida | bit3: trifásico
+  float    frequencia;      // Hz
+  float    vrms;            // V (fase-neutro)
+  float    irms;            // A
+  float    p;               // W   (total trifásico se bit3 = 1)
+  float    q;               // var
+  float    s;               // VA
+  float    fp;              // fator de potência
+  float    defasagem;       // graus (+ indutivo, - capacitivo)
+  float    thdV;            // %
+  float    thdI;            // %
+  uint16_t harmV[N_HARMONICOS - 1];  // H2..H10 da tensão, em % x 100
+  uint16_t harmI[N_HARMONICOS - 1];  // H2..H10 da corrente, em % x 100
+};
+
+// ===================== VARIÁVEIS =====================
+uint16_t amostrasV[N_AMOSTRAS];
+uint16_t amostrasI[N_AMOSTRAS];
+double vReal[N_AMOSTRAS];
+double vImag[N_AMOSTRAS];
+ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, N_AMOSTRAS, 3840.0);
+
+double freqRede    = 60.0;
+double mediaVAtual = 2048;
+
+double somaV2, somaI2, somaP;
+double harmV2[N_HARMONICOS + 1];
+double harmI2[N_HARMONICOS + 1];
+double cruzRe, cruzIm;
+int nCiclos, nAtrasos, nSaturadas;
+double iPicoCiclo;
+
+// Resultado de um relatório (~0,5 s)
+struct Medicao {
+  double freq, vrms, irms, p, q, s, fp, defasagem, thdV, thdI;
+  double pctV[N_HARMONICOS + 1], pctI[N_HARMONICOS + 1];
+  bool temTensao, temCorrente, partida;
+};
+
+// Acumulador para a média enviada por LoRa
+Medicao soma;
+int nRelatorios = 0;
+uint16_t contadorPacotes = 0;
+bool loraOk = false;
+
+// ================================================================
+void zerarAcumuladores() {
+  somaV2 = somaI2 = somaP = 0;
+  cruzRe = cruzIm = 0;
+  for (int h = 0; h <= N_HARMONICOS; h++) { harmV2[h] = 0; harmI2[h] = 0; }
+  nCiclos = nAtrasos = nSaturadas = 0;
+  iPicoCiclo = 0;
+}
+
+uint16_t lerADC(int pino) {
+  return (analogRead(pino) + analogRead(pino)) / 2;
+}
+
+// Lê tensão e corrente na ordem V, I, I, V
+void lerAmostra(uint16_t &v, uint16_t &i) {
+  uint32_t sv = analogRead(PINO_TENSAO);
+  uint32_t si = analogRead(PINO_CORRENTE);
+  si += analogRead(PINO_CORRENTE);
+  sv += analogRead(PINO_TENSAO);
+  v = sv / 2;
+  i = si / 2;
+}
+
+// Coleta 1 ciclo da rede (amostragem síncrona)
+void coletarCiclo() {
+  double intervaloUs = 1000000.0 / (freqRede * N_AMOSTRAS);
+  unsigned long t0 = micros();
+  for (int k = 0; k < N_AMOSTRAS; k++) {
+    unsigned long alvo = t0 + (unsigned long)(k * intervaloUs);
+    while ((long)(micros() - alvo) < 0) { }
+    if ((long)(micros() - alvo) > (long)(intervaloUs / 2)) nAtrasos++;
+    lerAmostra(amostrasV[k], amostrasI[k]);
+    if (amostrasV[k] <= 5 || amostrasV[k] >= 4090 || amostrasI[k] <= 5 || amostrasI[k] >= 4090) nSaturadas++;
+  }
+}
+
+void analisarFFT(uint16_t *amostras, double *acumHarm2, double &re1, double &im1) {
+  for (int k = 0; k < N_AMOSTRAS; k++) { vReal[k] = amostras[k]; vImag[k] = 0; }
+  FFT.dcRemoval();
+  FFT.compute(FFTDirection::Forward);
+  re1 = vReal[1];
+  im1 = vImag[1];
+  FFT.complexToMagnitude();
+  for (int h = 1; h <= N_HARMONICOS; h++) acumHarm2[h] += vReal[h] * vReal[h];
+}
+
+void processarCiclo() {
+  double mediaV = 0, mediaI = 0;
+  for (int k = 0; k < N_AMOSTRAS; k++) { mediaV += amostrasV[k]; mediaI += amostrasI[k]; }
+  mediaV /= N_AMOSTRAS;
+  mediaI /= N_AMOSTRAS;
+  mediaVAtual = mediaV;
+
+  // Tensão deslocada pela correção de fase dos sensores
+  double vCorr[N_AMOSTRAS];
+  double desloc = CORRECAO_FASE_GRAUS / 360.0 * N_AMOSTRAS;
+  for (int k = 0; k < N_AMOSTRAS; k++) {
+    double pos = fmod(k - desloc, (double)N_AMOSTRAS);
+    if (pos < 0) pos += N_AMOSTRAS;
+    int k0 = (int)pos;
+    int k1 = (k0 + 1) % N_AMOSTRAS;
+    double fr = pos - k0;
+    vCorr[k] = (amostrasV[k0] - mediaV) * (1 - fr) + (amostrasV[k1] - mediaV) * fr;
+  }
+
+  double sinalI = INVERTER_CORRENTE ? -1.0 : 1.0;
+  double somaICiclo = 0;
+  for (int k = 0; k < N_AMOSTRAS; k++) {
+    double v = vCorr[k] * FATOR_TENSAO;
+    double i = sinalI * (amostrasI[k] - mediaI) * FATOR_CORRENTE / N_VOLTAS;
+    somaV2 += v * v;
+    somaI2 += i * i;
+    somaICiclo += i * i;
+    somaP  += v * i;
+  }
+  double iCiclo = sqrt(somaICiclo / N_AMOSTRAS);
+  if (iCiclo > iPicoCiclo) iPicoCiclo = iCiclo;
+
+  double vRe, vIm, iRe, iIm;
+  analisarFFT(amostrasV, harmV2, vRe, vIm);
+  analisarFFT(amostrasI, harmI2, iRe, iIm);
+  if (INVERTER_CORRENTE) { iRe = -iRe; iIm = -iIm; }
+  cruzRe += vRe * iRe + vIm * iIm;
+  cruzIm += vIm * iRe - vRe * iIm;
+  nCiclos++;
+}
+
+// Frequência pelos cruzamentos por zero da tensão (~200 ms)
+double medirFrequencia() {
+  const unsigned long JANELA_US = 200000;
+  const int HISTERESE = 60;
+  double nivel = mediaVAtual;
+  unsigned long inicio = micros();
+  unsigned long tAnt = 0;
+  int vAnt = lerADC(PINO_TENSAO);
+  bool armado = false;
+  double tPrimeira = 0, tUltima = 0;
+  int nCruz = 0;
+  while (true) {
+    unsigned long t = micros() - inicio;
+    if (t > JANELA_US) break;
+    int v = lerADC(PINO_TENSAO);
+    if (v < nivel - HISTERESE) armado = true;
+    if (armado && vAnt < nivel && v >= nivel) {
+      double frac = (nivel - vAnt) / (double)(v - vAnt);
+      double tc = tAnt + frac * (double)(t - tAnt);
+      if (nCruz == 0) tPrimeira = tc;
+      tUltima = tc;
+      nCruz++;
+      armado = false;
+    }
+    vAnt = v;
+    tAnt = t;
+  }
+  if (nCruz >= 3) return (nCruz - 1) * 1000000.0 / (tUltima - tPrimeira);
+  return 0;
+}
+
+// Calcula as grandezas do relatório atual
+Medicao calcular(double freqMedida) {
+  Medicao m;
+  double nTotal = (double)nCiclos * N_AMOSTRAS;
+  double mult = TRIFASICO_EQUILIBRADO ? 3.0 : 1.0;
+
+  m.vrms = sqrt(somaV2 / nTotal);
+  double irms = sqrt(somaI2 / nTotal);
+  m.irms = sqrt(fmax(0.0, irms * irms - RUIDO_I_RMS * RUIDO_I_RMS));
+  double p = somaP / nTotal;
+  double s = m.vrms * m.irms;
+  double q = sqrt(fmax(0.0, s * s - p * p));
+  m.fp = (s > 0.001) ? p / s : 0;
+  m.p = mult * p;
+  m.q = mult * q;
+  m.s = mult * s;
+
+  m.defasagem = atan2(cruzIm, cruzRe) * 180.0 / PI - CORRECAO_FASE_GRAUS;
+  while (m.defasagem > 180.0)  m.defasagem -= 360.0;
+  while (m.defasagem < -180.0) m.defasagem += 360.0;
+
+  double hV[N_HARMONICOS + 1], hI[N_HARMONICOS + 1];
+  for (int k = 1; k <= N_HARMONICOS; k++) {
+    hV[k] = sqrt(harmV2[k] / nCiclos) * sqrt(2.0) / N_AMOSTRAS * FATOR_TENSAO;
+    hI[k] = sqrt(harmI2[k] / nCiclos) * sqrt(2.0) / N_AMOSTRAS * FATOR_CORRENTE / N_VOLTAS;
+  }
+  m.temTensao   = hV[1] >= VRMS_MINIMO;
+  m.temCorrente = hI[1] >= IRMS_MINIMO;
+  m.partida     = iPicoCiclo > I_PARTIDA;
+
+  double sV = 0, sI = 0;
+  for (int k = 2; k <= N_HARMONICOS; k++) {
+    m.pctV[k] = (hV[1] > 0) ? hV[k] / hV[1] * 100.0 : 0;
+    m.pctI[k] = (hI[1] > 0) ? hI[k] / hI[1] * 100.0 : 0;
+    sV += hV[k] * hV[k];
+    sI += hI[k] * hI[k];
+  }
+  m.thdV = (hV[1] > 0) ? sqrt(sV) / hV[1] * 100.0 : 0;
+  m.thdI = (hI[1] > 0) ? sqrt(sI) / hI[1] * 100.0 : 0;
+  m.freq = (m.temTensao && freqMedida > 0) ? freqRede : 0;
+
+  // Sem sinal: o que sobra é só ruído do ADC -> zera para não enviar valores falsos
+  if (!m.temTensao) {
+    m.vrms = 0; m.thdV = 0;
+    for (int k = 2; k <= N_HARMONICOS; k++) m.pctV[k] = 0;
+  }
+  if (!m.temCorrente) {
+    m.irms = 0; m.thdI = 0;
+    for (int k = 2; k <= N_HARMONICOS; k++) m.pctI[k] = 0;
+  }
+  if (!m.temTensao || !m.temCorrente) {
+    m.p = m.q = m.s = 0; m.fp = 0; m.defasagem = 0;
+  }
+  return m;
+}
+
+// Soma um relatório no acumulador da média
+void acumular(const Medicao &m) {
+  if (nRelatorios == 0) {
+    soma = m;
+  } else {
+    soma.freq += m.freq; soma.vrms += m.vrms; soma.irms += m.irms;
+    soma.p += m.p; soma.q += m.q; soma.s += m.s;
+    soma.defasagem += m.defasagem; soma.thdV += m.thdV; soma.thdI += m.thdI;
+    for (int k = 2; k <= N_HARMONICOS; k++) { soma.pctV[k] += m.pctV[k]; soma.pctI[k] += m.pctI[k]; }
+    soma.temTensao   = soma.temTensao && m.temTensao;
+    soma.temCorrente = soma.temCorrente && m.temCorrente;
+    soma.partida     = soma.partida || m.partida;
+  }
+  nRelatorios++;
+}
+
+uint16_t paraU16(double pct) {           // % -> % x 100 (0 a 655,35 %)
+  double x = pct * 100.0 + 0.5;
+  if (x < 0) x = 0;
+  if (x > 65535) x = 65535;
+  return (uint16_t)x;
+}
+
+// Monta o pacote com a média e envia por LoRa
+void enviarPacote() {
+  double n = nRelatorios;
+  PacoteQEE pk;
+  pk.contador   = contadorPacotes++;
+  pk.flags      = (soma.temTensao ? 1 : 0) | (soma.temCorrente ? 2 : 0) |
+                  (soma.partida ? 4 : 0) | (TRIFASICO_EQUILIBRADO ? 8 : 0);
+  pk.frequencia = soma.freq / n;
+  pk.vrms       = soma.vrms / n;
+  pk.irms       = soma.irms / n;
+  pk.p          = soma.p / n;
+  pk.q          = soma.q / n;
+  pk.s          = soma.s / n;
+  pk.fp         = (pk.s > 0.001) ? pk.p / pk.s : 0;
+  pk.defasagem  = soma.defasagem / n;
+  pk.thdV       = soma.thdV / n;
+  pk.thdI       = soma.thdI / n;
+  for (int k = 2; k <= N_HARMONICOS; k++) {
+    pk.harmV[k - 2] = paraU16(soma.pctV[k] / n);
+    pk.harmI[k - 2] = paraU16(soma.pctI[k] / n);
+  }
+
+  Serial.println();
+  Serial.printf(">>> Pacote %u | V = %.1f V | I = %.3f A | P = %.1f W | FP = %.3f | THD V = %.2f %% | THD I = %.2f %%\n",
+                pk.contador, pk.vrms, pk.irms, pk.p, pk.fp, pk.thdV, pk.thdI);
+
+  if (!loraOk) {
+    Serial.println("    (LoRa nao iniciado: pacote NAO enviado)");
+    return;
+  }
+  unsigned long t0 = millis();
+  LoRa.beginPacket();
+  LoRa.write((uint8_t *)&pk, sizeof(pk));
+  LoRa.endPacket();                      // espera terminar a transmissão
+  Serial.printf("    Enviado por LoRa: %u bytes em %lu ms\n", (unsigned)sizeof(pk), millis() - t0);
+}
+
+// ================================================================
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  delay(1000);
+  Serial.println("TRANSMISSOR - prototipo de qualidade de energia");
+
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (LoRa.begin(LORA_FREQ)) {
+    LoRa.setSpreadingFactor(LORA_SF);
+    LoRa.setSignalBandwidth(LORA_BANDA);
+    LoRa.setSyncWord(LORA_SYNC_WORD);
+    LoRa.setTxPower(LORA_POTENCIA);
+    LoRa.enableCrc();
+    loraOk = true;
+    Serial.printf("LoRa OK: %.0f MHz, SF%d, pacote de %u bytes\n",
+                  LORA_FREQ / 1e6, LORA_SF, (unsigned)sizeof(PacoteQEE));
+  } else {
+    Serial.println("ERRO: modulo LoRa nao encontrado. Confira 3V3, GND e os pinos SPI.");
+    Serial.println("      A medicao continua, mas nada sera enviado.");
+  }
+}
+
+void loop() {
+  // 1) Mede ~0,5 s de sinal
+  zerarAcumuladores();
+  for (int c = 0; c < N_CICLOS_MEDIA; c++) {
+    coletarCiclo();
+    processarCiclo();
+  }
+  double f = medirFrequencia();
+  if (f > 55.0 && f < 65.0) freqRede = 0.7 * freqRede + 0.3 * f;
+
+  // 2) Calcula e acumula para a média
+  Medicao m = calcular(f);
+  acumular(m);
+  if (nAtrasos > 0)   Serial.println("AVISO: ADC atrasou amostras neste relatorio.");
+  if (nSaturadas > 0) Serial.println("AVISO: sinal saturou (0 ou 4095) neste relatorio.");
+
+  // 3) A cada RELATORIOS_POR_ENVIO relatórios, envia a média por LoRa
+  if (nRelatorios >= RELATORIOS_POR_ENVIO) {
+    enviarPacote();
+    nRelatorios = 0;
+  }
+}
