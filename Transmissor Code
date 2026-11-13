@@ -1,11 +1,14 @@
 /*
  * ================================================================
  *  TRANSMISSOR LoRa - Protótipo de qualidade de energia (ESP32 A)
- *  Ponto de medição: mede o motor WEG W22 Plus e envia por LoRa
+ *  VERSÃO MONOFÁSICA: motor Kohlbach ME-5000, 1/2 cv (0,37 kW),
+ *  ligado em 127 V (In = 9,4 A, cos phi 0,63, Ip/In = 4,8)
  * ================================================================
- *  Sensores (iguais ao teste do motor):
- *    Tensão:   ZMPT101B entre FASE L1 e NEUTRO -> divisor 10k/20k -> GPIO34
- *    Corrente: SCT-013 30A/1V só na FASE L1 -> 1,65 V (10k/10k) -> 1k -> GPIO35
+ *  Sensores:
+ *    Tensão:   ZMPT101B entre FASE e NEUTRO (127 V) -> divisor 10k/20k -> GPIO34
+ *    Corrente: SCT-013 30A/1V só no fio FASE do motor -> 1,65 V (10k/10k)
+ *              -> 1k -> GPIO35
+ *  Monofásico: P, Q e S são da própria fase (NÃO multiplica por 3).
  *
  *  Módulo LoRa RFM95W (alimentar SOMENTE com 3,3 V):
  *    RFM95W  ->  ESP32
@@ -21,6 +24,11 @@
  *   troquem os números em "PINOS DO LoRa")
  *
  *  Bibliotecas: arduinoFFT (Enrique Condes) 2.x  e  LoRa (Sandeep Mistry)
+ *
+ *  TEMPO REAL:
+ *   - mede sem parar: 1 leitura a cada ~0,3 s (aparece no Monitor Serial)
+ *   - a cada INTERVALO_ENVIO_MS envia 1 pacote LoRa com a média das
+ *     leituras desse intervalo (padrão: 1 pacote por segundo)
  * ================================================================
  */
 #include <SPI.h>
@@ -46,38 +54,46 @@ const int     LORA_SF          = 7;      // 7 = mais rápido; 9 a 12 = mais alca
 const long    LORA_BANDA       = 125E3;  // largura de banda (Hz)
 const uint8_t LORA_SYNC_WORD   = 0xF3;   // "senha" da rede (igual nos dois)
 const int     LORA_POTENCIA    = 17;     // dBm (2 a 20)
-const int     RELATORIOS_POR_ENVIO = 6;  // média de 6 relatórios (~4 s) por pacote
+const int     REINICIAR_LORA_A_CADA = 120; // reinicia o módulo a cada 120 pacotes (~2 min)
+
+// ===================== TEMPO REAL (ajuste aqui) =====================
+// Intervalo entre pacotes LoRa (o "delay"). Mínimo recomendado: 500 ms
+// (cada pacote ocupa o rádio por ~0,15 s). 1000 = 1 pacote por segundo.
+const unsigned long INTERVALO_ENVIO_MS = 1000;
+// true = mostra no Monitor Serial cada leitura (~3 por segundo)
+const bool MOSTRAR_CADA_LEITURA = true;
 
 // ===================== AMOSTRAGEM =====================
 const int N_AMOSTRAS     = 64;   // amostras por ciclo da rede
-const int N_CICLOS_MEDIA = 30;   // ciclos por relatório (~0,5 s)
+const int N_CICLOS_MEDIA = 48;   // ciclos por leitura (~0,2 s)
+const unsigned long JANELA_FREQ_US = 100000;  // medição da frequência (~0,1 s)
 const int N_HARMONICOS   = 10;   // harmônicos (60 Hz até 600 Hz)
 
 // ===================== CALIBRAÇÃO =====================
-const double FATOR_TENSAO   = 0.30;   // V por contagem do ADC
+const double FATOR_TENSAO   = 0.292;  // linha 71 (use o valor da sua conta)
 const double FATOR_CORRENTE = 0.024;  // A por contagem do ADC
-const int    N_VOLTAS       = 1;      // motor: 1 volta na pinça
+const int    N_VOLTAS       = 1;      // motor: 1 volta na pinça (9,4 A nominal)
 const double RUIDO_I_RMS    = 0.0;
-// Deixe igual ao teste do motor que deu certo (FP indutivo e P positiva).
-// Se a potência ativa sair negativa, troque para true OU vire a pinça.
+// Se a potência ativa sair negativa, vire a pinça (ou troque para true).
 const bool   INVERTER_CORRENTE   = false;
-const double CORRECAO_FASE_GRAUS = 23.6;  // calibrada com a lâmpada
-const bool   TRIFASICO_EQUILIBRADO = true; // motor: envia totais trifásicos (x3)
+const double CORRECAO_FASE_GRAUS = 23.6;  // troque pelo valor da calibração com a lâmpada
+const bool   TRIFASICO_EQUILIBRADO = false; // motor MONOFÁSICO: não multiplica por 3
 
 // ===================== LIMIARES =====================
 const double VRMS_MINIMO = 20.0;
 const double IRMS_MINIMO = 0.10;
-const double I_PARTIDA   = 1.5 * 3.42;   // acima disso: considera partida (A)
+const double I_NOMINAL   = 9.4;          // corrente nominal do motor em 127 V (placa)
+const double I_PARTIDA   = 1.5 * I_NOMINAL; // acima disso: considera partida (A)
 
 // ===================== PACOTE LoRa =====================
 // A MESMA struct tem que estar no receptor (mesma ordem e mesmos tipos)
 struct __attribute__((packed)) PacoteQEE {
   uint16_t contador;        // número do pacote (para detectar perdas)
-  uint8_t  flags;           // bit0: tem tensão | bit1: tem corrente | bit2: partida | bit3: trifásico
+  uint8_t  flags;           // bit0: tem tensão | bit1: tem corrente | bit2: partida | bit3: trifásico (aqui = 0)
   float    frequencia;      // Hz
   float    vrms;            // V (fase-neutro)
   float    irms;            // A
-  float    p;               // W   (total trifásico se bit3 = 1)
+  float    p;               // W   (monofásico: da própria fase)
   float    q;               // var
   float    s;               // VA
   float    fp;              // fator de potência
@@ -105,7 +121,7 @@ double cruzRe, cruzIm;
 int nCiclos, nAtrasos, nSaturadas;
 double iPicoCiclo;
 
-// Resultado de um relatório (~0,5 s)
+// Resultado de uma leitura (~0,3 s)
 struct Medicao {
   double freq, vrms, irms, p, q, s, fp, defasagem, thdV, thdI;
   double pctV[N_HARMONICOS + 1], pctI[N_HARMONICOS + 1];
@@ -117,6 +133,10 @@ Medicao soma;
 int nRelatorios = 0;
 uint16_t contadorPacotes = 0;
 bool loraOk = false;
+unsigned long ultimoEnvioMs = 0;
+unsigned long nLeituras = 0;
+
+void iniciarLoRa();   // definida mais abaixo
 
 // ================================================================
 void zerarAcumuladores() {
@@ -205,9 +225,9 @@ void processarCiclo() {
   nCiclos++;
 }
 
-// Frequência pelos cruzamentos por zero da tensão (~200 ms)
+// Frequência pelos cruzamentos por zero da tensão (~100 ms)
 double medirFrequencia() {
-  const unsigned long JANELA_US = 200000;
+  const unsigned long JANELA_US = JANELA_FREQ_US;
   const int HISTERESE = 60;
   double nivel = mediaVAtual;
   unsigned long inicio = micros();
@@ -236,7 +256,7 @@ double medirFrequencia() {
   return 0;
 }
 
-// Calcula as grandezas do relatório atual
+// Calcula as grandezas da leitura atual
 Medicao calcular(double freqMedida) {
   Medicao m;
   double nTotal = (double)nCiclos * N_AMOSTRAS;
@@ -292,7 +312,7 @@ Medicao calcular(double freqMedida) {
   return m;
 }
 
-// Soma um relatório no acumulador da média
+// Soma uma leitura no acumulador da média
 void acumular(const Medicao &m) {
   if (nRelatorios == 0) {
     soma = m;
@@ -337,19 +357,56 @@ void enviarPacote() {
     pk.harmI[k - 2] = paraU16(soma.pctI[k] / n);
   }
 
-  Serial.println();
-  Serial.printf(">>> Pacote %u | V = %.1f V | I = %.3f A | P = %.1f W | FP = %.3f | THD V = %.2f %% | THD I = %.2f %%\n",
-                pk.contador, pk.vrms, pk.irms, pk.p, pk.fp, pk.thdV, pk.thdI);
+  Serial.printf(">>> PACOTE %u (media de %d leituras) | V = %.1f V | I = %.3f A | P = %.1f W | FP = %.3f | Defasagem = %.1f graus | THD V = %.2f %% | THD I = %.2f %%\n",
+                pk.contador, nRelatorios, pk.vrms, pk.irms, pk.p, pk.fp, pk.defasagem, pk.thdV, pk.thdI);
 
-  if (!loraOk) {
-    Serial.println("    (LoRa nao iniciado: pacote NAO enviado)");
-    return;
+  // Reinicia o módulo de tempos em tempos (recupera se ele resetou por queda de tensão)
+  if (loraOk && pk.contador > 0 && pk.contador % REINICIAR_LORA_A_CADA == 0) {
+    iniciarLoRa();
   }
-  unsigned long t0 = millis();
-  LoRa.beginPacket();
+  if (!loraOk) {
+    iniciarLoRa();
+    if (!loraOk) {
+      Serial.println("    LoRa nao respondeu: pacote NAO enviado (a medicao continua)");
+      return;
+    }
+  }
+  // beginPacket() devolve 0 se o módulo ainda estiver "transmitindo" o pacote
+  // anterior (1 s atrás) -> sinal de que ele travou. Reinicia e tenta de novo.
+  if (!LoRa.beginPacket()) {
+    Serial.println("    AVISO: modulo LoRa travado. Reiniciando o modulo...");
+    iniciarLoRa();
+    if (!loraOk || !LoRa.beginPacket()) {
+      Serial.println("    Pacote NAO enviado (a medicao continua)");
+      return;
+    }
+  }
   LoRa.write((uint8_t *)&pk, sizeof(pk));
-  LoRa.endPacket();                      // espera terminar a transmissão
-  Serial.printf("    Enviado por LoRa: %u bytes em %lu ms\n", (unsigned)sizeof(pk), millis() - t0);
+  LoRa.endPacket(true);   // true = NAO espera terminar: o programa nunca trava aqui
+  Serial.printf("    Enviado por LoRa: %u bytes\n", (unsigned)sizeof(pk));
+}
+
+// Mostra uma leitura no Monitor Serial (tempo real)
+void imprimirLeitura(const Medicao &m) {
+  Serial.printf("[%8.2f s] V = %.1f V | I = %.3f A | P = %.1f W | FP = %.3f | Def = %.1f graus | f = %.2f Hz | THD V = %.2f %% | THD I = %.2f %%%s\n",
+                millis() / 1000.0, m.vrms, m.irms, m.p, m.fp, m.defasagem, m.freq,
+                m.thdV, m.thdI, m.partida ? " | PARTIDA" : "");
+}
+
+// Liga e configura o módulo LoRa (também usado para reiniciá-lo)
+void iniciarLoRa() {
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (LoRa.begin(LORA_FREQ)) {          // begin() também dá um reset no módulo pelo pino RST
+    LoRa.setSpreadingFactor(LORA_SF);
+    LoRa.setSignalBandwidth(LORA_BANDA);
+    LoRa.setSyncWord(LORA_SYNC_WORD);
+    LoRa.setTxPower(LORA_POTENCIA);
+    LoRa.enableCrc();
+    loraOk = true;
+  } else {
+    loraOk = false;
+  }
 }
 
 // ================================================================
@@ -358,27 +415,24 @@ void setup() {
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
   delay(1000);
-  Serial.println("TRANSMISSOR - prototipo de qualidade de energia");
+  Serial.println("TRANSMISSOR - prototipo de qualidade de energia (MONOFASICO)");
+  Serial.printf("Motor monofasico 127 V | In = %.1f A | voltas na pinca: %d | correcao: %.1f graus\n",
+                I_NOMINAL, N_VOLTAS, CORRECAO_FASE_GRAUS);
 
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if (LoRa.begin(LORA_FREQ)) {
-    LoRa.setSpreadingFactor(LORA_SF);
-    LoRa.setSignalBandwidth(LORA_BANDA);
-    LoRa.setSyncWord(LORA_SYNC_WORD);
-    LoRa.setTxPower(LORA_POTENCIA);
-    LoRa.enableCrc();
-    loraOk = true;
+  iniciarLoRa();
+  if (loraOk) {
     Serial.printf("LoRa OK: %.0f MHz, SF%d, pacote de %u bytes\n",
                   LORA_FREQ / 1e6, LORA_SF, (unsigned)sizeof(PacoteQEE));
   } else {
     Serial.println("ERRO: modulo LoRa nao encontrado. Confira 3V3, GND e os pinos SPI.");
-    Serial.println("      A medicao continua, mas nada sera enviado.");
+    Serial.println("      A medicao continua e o programa tenta de novo a cada pacote.");
   }
+  Serial.printf("Envio a cada %lu ms | leitura a cada ~0,3 s\n", INTERVALO_ENVIO_MS);
+  ultimoEnvioMs = millis();
 }
 
 void loop() {
-  // 1) Mede ~0,5 s de sinal
+  // 1) Mede ~0,2 s de sinal (12 ciclos) + frequência (~0,1 s)
   zerarAcumuladores();
   for (int c = 0; c < N_CICLOS_MEDIA; c++) {
     coletarCiclo();
@@ -387,14 +441,18 @@ void loop() {
   double f = medirFrequencia();
   if (f > 55.0 && f < 65.0) freqRede = 0.7 * freqRede + 0.3 * f;
 
-  // 2) Calcula e acumula para a média
+  // 2) Calcula, mostra na hora e acumula para a média do pacote
   Medicao m = calcular(f);
   acumular(m);
-  if (nAtrasos > 0)   Serial.println("AVISO: ADC atrasou amostras neste relatorio.");
-  if (nSaturadas > 0) Serial.println("AVISO: sinal saturou (0 ou 4095) neste relatorio.");
+  nLeituras++;
+  if (MOSTRAR_CADA_LEITURA) imprimirLeitura(m);
+  if (nAtrasos > 0)   Serial.println("AVISO: ADC atrasou amostras nesta leitura.");
+  if (nSaturadas > 0) Serial.println("AVISO: sinal saturou (0 ou 4095) nesta leitura.");
 
-  // 3) A cada RELATORIOS_POR_ENVIO relatórios, envia a média por LoRa
-  if (nRelatorios >= RELATORIOS_POR_ENVIO) {
+  // 3) Passou o intervalo? Envia a média das leituras por LoRa
+  //    (usa millis() em vez de delay(): a medição nunca para)
+  if (millis() - ultimoEnvioMs >= INTERVALO_ENVIO_MS) {
+    ultimoEnvioMs = millis();
     enviarPacote();
     nRelatorios = 0;
   }
