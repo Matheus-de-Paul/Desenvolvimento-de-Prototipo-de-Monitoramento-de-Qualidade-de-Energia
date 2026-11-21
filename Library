@@ -1,0 +1,8 @@
+Bibliotecas usadas:
+- *arduinoFFT* (versão 2.x), de Enrique Condes: usada no transmissor para calcular a FFT, os harmônicos e a THD.
+- *LoRa*, de Sandeep Mistry: usada no transmissor e no receptor para controlar o rádio RFM95W.
+- *SPI*, que já vem com o pacote do ESP32: faz a ligação entre o ESP32 e o RFM95W.
+- *LiquidCrystal*, que já vem na Arduino IDE: usada no receptor para o display LCD 16x2.
+- *ArduinoIoTCloud*, da Arduino: usada no receptor para mandar os dados ao dashboard do Arduino Cloud.
+- *Arduino_ConnectionHandler*, da Arduino: usada no receptor para a conexão Wi-Fi. Ela é instalada junto com a ArduinoIoTCloud.
+- *Pacote de placas esp32*, da Espressif Systems: necessário para programar o ESP32 na Arduino IDE.
